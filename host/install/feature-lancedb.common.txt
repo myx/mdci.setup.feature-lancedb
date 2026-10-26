@@ -1,0 +1,134 @@
+#!/bin/sh
+
+##
+## setup.feature-lancedb: what the install, uninstall and check fragments share. Sourced by them, never run by itself.
+## The pins, the platform test, the home folder and the one way to run a Python inside it.
+##
+
+LANCEDB_PIN_LANCEDB="0.40.0"
+LANCEDB_PIN_MODEL2VEC="0.10.0"
+LANCEDB_PIN_SAFETENSORS="0.8.0"
+LANCEDB_MODEL_NAME="potion-base-8M"
+LANCEDB_MODEL_REPO="minishlab/potion-base-8M"
+LANCEDB_MODEL_REVISION="bf8b056651a2c21b8d2565580b8569da283cab23"
+LANCEDB_MODEL_DIM="256"
+LANCEDB_HOME_MARK=".mdci-lancedb-home"
+## FreeBSD amd64: the system packages the environment sees, python312 as the ports' PYTHON_DEFAULT is 3.12
+LANCEDB_FREEBSD_PYTHON="/usr/local/bin/python3.12"
+## model2vec's Requires-Dist, each from its port: numpy, tokenizers, huggingface-hub, tqdm, Jinja2, joblib
+LANCEDB_FREEBSD_PKGS="python312 py312-pip py312-lancedb py312-numpy py312-tokenizers py312-huggingface-hub py312-tqdm py312-Jinja2 py312-joblib rust"
+
+LancedbSay(){ ## text -- on standard error
+	echo "setup.feature-lancedb: $*" >&2
+}
+
+LancedbRefuse(){ ## text -- why, on standard error; rc 1
+	echo "setup.feature-lancedb: ⛔ ERROR: $*" >&2
+	return 1
+}
+
+## The home folder: LANCEDB_HOME if given (absolute), else .local/lancedb of the workspace. Sets LANCEDB_HOME.
+LancedbHome(){
+	if [ -n "${LANCEDB_HOME:-}" ] ; then
+		case "$LANCEDB_HOME" in
+			/*) return 0 ;;
+		esac
+		LancedbRefuse "LANCEDB_HOME must be an absolute path: '$LANCEDB_HOME'"
+		return 1
+	fi
+	[ -n "${MMDAPP:-}" ] && [ -d "$MMDAPP/.local" ] || { LancedbRefuse "no workspace: MMDAPP is not set, or has no .local (or give LANCEDB_HOME)" ; return 1 ; }
+	LANCEDB_HOME="$MMDAPP/.local/lancedb"
+}
+
+## Where this machine stands: prints the platform on standard output and rc 0, or why it cannot and rc 1.
+## One path per platform: macOS arm64, Linux (glibc) on x86_64 with AVX2 and FMA or on aarch64, and FreeBSD amd64. Nothing else.
+LancedbPlatform(){
+	lpSystem="$( uname -s )" ; lpMachine="$( uname -m )"
+	case "$lpSystem/$lpMachine" in
+		Darwin/arm64)
+			echo "macOS arm64"
+			return 0
+		;;
+		Darwin/*)
+			echo "$lpSystem $lpMachine: LanceDB publishes no wheel for Intel macOS"
+			return 1
+		;;
+		Linux/x86_64|Linux/amd64|Linux/aarch64|Linux/arm64)
+			if ldd --version 2>&1 | grep -qi musl ; then
+				echo "Linux $lpMachine with musl: LanceDB publishes manylinux (glibc) wheels only"
+				return 1
+			fi
+			case "$lpMachine" in
+				x86_64|amd64)
+					if [ -r /proc/cpuinfo ] && ! { grep -qw avx2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo ; } ; then
+						echo "Linux $lpMachine without AVX2 and FMA: the LanceDB wheel stops with 'Illegal instruction' on such a processor"
+						return 1
+					fi
+				;;
+			esac
+			echo "Linux $lpMachine"
+			return 0
+		;;
+		FreeBSD/amd64)
+			echo "FreeBSD amd64"
+			return 0
+		;;
+		FreeBSD/*)
+			echo "FreeBSD $lpMachine: LanceDB stays off here, as the port py-lancedb is broken on $lpMachine (lancedb issue 3764)"
+			return 1
+		;;
+	esac
+	echo "$lpSystem $lpMachine: not covered; LanceDB installs on macOS arm64, Linux and FreeBSD amd64 only"
+	return 1
+}
+
+## A Python of the environment, run isolated (-I), confined to the home folder: nothing cached or written in the home of the user.
+## LANCEDB_HF_OFFLINE=0 (set by the caller, for the one model download) lets Hugging Face Hub reach the net; else it is off.
+LancedbRun(){ ## python, its arguments...
+	lrPython="$1"
+	shift
+	env \
+		PIP_NO_CACHE_DIR=1 \
+		PIP_DISABLE_PIP_VERSION_CHECK=1 \
+		PIP_NO_INPUT=1 \
+		HF_HOME="$LANCEDB_HOME/hf" \
+		XDG_CACHE_HOME="$LANCEDB_HOME/cache" \
+		CARGO_HOME="$LANCEDB_HOME/cache/cargo" \
+		HF_HUB_DISABLE_TELEMETRY=1 \
+		HF_HUB_OFFLINE="${LANCEDB_HF_OFFLINE:-1}" \
+		DO_NOT_TRACK=1 \
+		TMPDIR="$LANCEDB_HOME/tmp" \
+		"$lrPython" -I "$@"
+}
+
+## The environment imports both packages, loads the model from its folder and encodes with it. Prints
+## `lancedb=<v> model2vec=<v> dim=<n>` and rc 0, or rc non-zero. Reads only.
+LancedbProbe(){
+	LancedbRun "$LANCEDB_HOME/venv/bin/python" -c '
+import sys, importlib.metadata as m
+import lancedb
+from model2vec import StaticModel
+v = StaticModel.from_pretrained(sys.argv[1]).encode(["probe"])
+print("lancedb=%s model2vec=%s dim=%d" % (m.version("lancedb"), m.version("model2vec"), v.shape[1]))
+' "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME"
+}
+
+## A test query: three sentences embedded and put in a table in a scratch folder of the home, and the nearest to a question must be
+## the right one. The scratch folder is removed. rc 0 when it is.
+LancedbQueryTest(){
+	LancedbRun "$LANCEDB_HOME/venv/bin/python" -c '
+import sys, os, shutil, tempfile
+import lancedb
+from model2vec import StaticModel
+model = StaticModel.from_pretrained(sys.argv[1])
+texts = ["the cat sleeps on the sofa", "a database index makes queries faster", "rain is forecast for tomorrow"]
+scratch = tempfile.mkdtemp(prefix="query-test.")
+try:
+    table = lancedb.connect(scratch).create_table("probe", data=[{"text": t, "vector": v.tolist()} for t, v in zip(texts, model.encode(texts))])
+    found = table.search(model.encode(["how to speed up a database query"])[0].tolist()).limit(1).to_list()
+    ok = len(found) == 1 and found[0]["text"] == texts[1]
+finally:
+    shutil.rmtree(scratch, ignore_errors=True)
+sys.exit(0 if ok else 1)
+' "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME"
+}

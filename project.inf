@@ -1,0 +1,12 @@
+Name: setup.feature-lancedb
+Requires: \
+	
+
+Provides: \
+	standard/setup.feature-lancedb \
+	\
+
+Keywords: \
+	feature.lancedb \
+
+Includes: 

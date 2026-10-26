@@ -1,0 +1,65 @@
+#!/bin/sh
+
+##
+## setup.feature-lancedb check: is it installed, how big is it, does a test query work. It changes nothing but a scratch folder in
+## the home folder of the feature, removed at once.
+##
+##   sh feature-lancedb.check.txt
+##
+## On standard output, `key: value` lines, the first is `lancedb:`:
+##   lancedb: installed | not installed | broken | not supported here
+##   platform, home, size, lancedb, model2vec, model (name and revision), dim, query: ok | failed
+## Exit: 0 installed and the test query works, 1 not installed, 2 installed and broken, 3 this platform is not covered.
+##
+
+lancedbDir="$( cd "$( dirname "$0" )" && pwd -P )"
+. "$lancedbDir/feature-lancedb.common.txt" || exit 1
+
+LancedbCheck(){
+	LancedbHome || return 1
+
+	platform="$( LancedbPlatform )" ; platformRc=$?
+	if [ "$platformRc" != 0 ] && [ ! -f "$LANCEDB_HOME/lancedb.env" ] ; then
+		echo "lancedb: not supported here"
+		echo "platform: $platform"
+		return 3
+	fi
+	if [ ! -f "$LANCEDB_HOME/lancedb.env" ] ; then
+		echo "lancedb: not installed"
+		echo "platform: $platform"
+		echo "home: $LANCEDB_HOME"
+		return 1
+	fi
+
+	size="$( du -sk "$LANCEDB_HOME" 2> /dev/null | awk '{ print int( ( $1 + 1023 ) / 1024 ) }' )"
+	echo "platform: $platform"
+	echo "home: $LANCEDB_HOME"
+	echo "size: ${size:-unknown} MB"
+
+	if [ ! -x "$LANCEDB_HOME/venv/bin/python" ] || [ ! -d "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME" ] ; then
+		echo "lancedb: broken"
+		echo "why: the environment or the model is missing; uninstall and install again"
+		return 2
+	fi
+	mkdir -p "$LANCEDB_HOME/tmp"
+
+	probe="$( LancedbProbe 2> /dev/null )" || probe=""
+	if [ -z "$probe" ] ; then
+		echo "lancedb: broken"
+		echo "why: the packages do not import, or the model does not load"
+		return 2
+	fi
+	echo "lancedb: installed"
+	echo "versions: $probe"
+	( . "$LANCEDB_HOME/lancedb.env" && echo "model: $LANCEDB_MODEL_NAME @ $LANCEDB_MODEL_REVISION, dim $LANCEDB_MODEL_DIM" )
+
+	if LancedbQueryTest > /dev/null 2>&1 ; then
+		echo "query: ok"
+		return 0
+	fi
+	echo "query: failed"
+	return 2
+}
+
+LancedbCheck "$@"
+exit $?

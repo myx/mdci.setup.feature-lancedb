@@ -1,0 +1,39 @@
+#!/bin/sh
+
+##
+## setup.feature-lancedb uninstall: removes the private environment, the model, the downloaded packages and the caches.
+##
+##   sh feature-lancedb.uninstall.txt
+##
+## It removes the home folder ($LANCEDB_HOME, else $MMDAPP/.local/lancedb), and only when that folder is one of this feature's
+## (it carries .mdci-lancedb-home): any other folder is refused and left as it is. It does not touch the embedded Python of the
+## local tools (other tools use it), nor the system packages on FreeBSD, and it does not touch any store: the MAGIC.LanceDB folders beside the MAGIC.md files hold
+## the knowledge of their workspace and stay.
+## Exit: 0 removed, or nothing there to remove; 1 refused.
+##
+
+lancedbDir="$( cd "$( dirname "$0" )" && pwd -P )"
+. "$lancedbDir/feature-lancedb.common.txt" || exit 1
+
+LancedbUninstall(){
+	LancedbHome || return 1
+
+	if [ ! -e "$LANCEDB_HOME" ] ; then
+		LancedbSay "not installed, nothing to remove: $LANCEDB_HOME"
+		return 0
+	fi
+	case "$LANCEDB_HOME" in
+		/|"$HOME"|"${HOME:-/}/")
+			LancedbRefuse "refusing to remove $LANCEDB_HOME: it is no folder of this feature"
+			return 1
+		;;
+	esac
+	[ -f "$LANCEDB_HOME/$LANCEDB_HOME_MARK" ] || { LancedbRefuse "$LANCEDB_HOME is not a folder of this feature (no $LANCEDB_HOME_MARK): left as it is" ; return 1 ; }
+
+	rm -f "$LANCEDB_HOME/lancedb.env"
+	rm -rf "$LANCEDB_HOME" || { LancedbRefuse "could not remove $LANCEDB_HOME" ; return 1 ; }
+	LancedbSay "removed: $LANCEDB_HOME (the embedded Python and the stores were not touched)"
+}
+
+LancedbUninstall "$@"
+exit $?

@@ -1,0 +1,241 @@
+#!/bin/sh
+
+##
+## setup.feature-lancedb install: LanceDB and the embedding model in a private environment.
+##
+##   sh feature-lancedb.install.txt [--from-folder <folder>]
+##
+## The environment is $LANCEDB_HOME, else $MMDAPP/.local/lancedb, and nothing is written outside it and the embedded Python's
+## own folder: not the system Python, not the home folder of the user, not a shell startup file. The Python is the embedded Python
+## of the local tools (DistroLocalTools.fn.sh --install-embedded-python), asked of that tool and never made again here.
+##   venv/        the environment: lancedb, model2vec and what they need, from binary packages alone; on FreeBSD amd64 it sees
+##                the system's py312-lancedb and model2vec's other dependencies from pkg, and holds model2vec and safetensors (built with pkg rust)
+##   wheelhouse/  the packages as downloaded; with model/ it is what --from-folder installs from on a host with no internet
+##   model/       potion-base-8M, a pinned revision, the files model2vec reads
+##   licenses/    the licence files of every package, packages.txt the list of them
+##   hf/ cache/ tmp/   the caches and the temp folder of the processes it runs
+##   lancedb.env  written last: its presence is what says the install is whole
+## On standard output it prints the Python of the environment, one line; everything else is said on standard error.
+## Exit: 0 installed (or already), 1 refused or failed (nothing left), 3 this platform is not covered (nothing written).
+## It is safe to run again: what stands at the pinned versions is left as it is.
+##
+
+lancedbDir="$( cd "$( dirname "$0" )" && pwd -P )"
+. "$lancedbDir/feature-lancedb.common.txt" || exit 1
+
+## the wheels of the folder given or of the wheelhouse: name, version and licence, TAB-separated, one a wheel, on standard output;
+## with a folder of licences as the first argument, their licence files are copied into <folder>/<name>-<version>/ as well
+LANCEDB_PY_WHEELS='
+import sys, os, re, zipfile, shutil, email.parser
+target = sys.argv[1]
+for wheel in sorted(sys.argv[2:]):
+    with zipfile.ZipFile(wheel) as z:
+        names = z.namelist()
+        meta = [n for n in names if re.match(r"^[^/]+\.dist-info/METADATA$", n)]
+        head = email.parser.Parser().parsestr(z.read(meta[0]).decode("utf-8", "replace"), headersonly=True) if meta else None
+        base = os.path.basename(wheel).split("-")
+        name = (head["Name"] if head and head["Name"] else base[0])
+        version = (head["Version"] if head and head["Version"] else base[1])
+        licence = "unknown"
+        if head:
+            classifiers = [c.split(" :: ")[-1] for c in head.get_all("Classifier", []) if c.startswith("License :: ")]
+            if head["License-Expression"]:
+                licence = head["License-Expression"]
+            elif classifiers:
+                licence = "; ".join(classifiers)
+            elif head["License"]:
+                licence = head["License"].strip().splitlines()[0][:60]
+        name = re.sub(r"[^A-Za-z0-9._+-]", "_", name)
+        version = re.sub(r"[^A-Za-z0-9._+-]", "_", version)
+        print("%s\t%s\t%s" % (name, version, licence))
+        if target != "-":
+            folder = os.path.join(target, "%s-%s" % (name, version))
+            os.makedirs(folder, exist_ok=True)
+            for n in names:
+                parts = n.split("/")
+                if len(parts) > 1 and parts[0].endswith(".dist-info") and not n.endswith("/") and (
+                        "licenses" in parts[1:-1] or re.match(r"^(LICEN[CS]E|NOTICE|COPYING|AUTHORS)", parts[-1])):
+                    with z.open(n) as src, open(os.path.join(folder, parts[-1]), "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+'
+
+## the base Python: the embedded one of the local tools, asked of that tool, or on FreeBSD the system's, with the packages it needs from pkg.
+## Sets LANCEDB_BASE_PYTHON.
+LancedbEmbeddedPython(){
+	if [ "$( uname -s )" = FreeBSD ] ; then
+		lepMissing=""
+		for lepPkg in $LANCEDB_FREEBSD_PKGS ; do
+			pkg info -e "$lepPkg" || lepMissing="$lepMissing $lepPkg"
+		done
+		if [ -n "$lepMissing" ] ; then
+			[ "$( id -u )" = 0 ] || { LancedbRefuse "system packages missing, so nothing was installed; as root: pkg install -y$lepMissing" ; return 1 ; }
+			LancedbSay "installing the system packages:$lepMissing"
+			pkg install -y $lepMissing >&2 || { LancedbRefuse "pkg could not install:$lepMissing (see above), so nothing was installed" ; return 1 ; }
+		fi
+		LANCEDB_BASE_PYTHON="$LANCEDB_FREEBSD_PYTHON"
+		[ -x "$LANCEDB_BASE_PYTHON" ] || { LancedbRefuse "the system Python is not here: '$LANCEDB_BASE_PYTHON'" ; return 1 ; }
+		return 0
+	fi
+	[ -n "${MMDAPP:-}" ] && [ -d "$MMDAPP/.local" ] || { LancedbRefuse "no workspace: MMDAPP is not set, or has no .local (the embedded Python is the workspace's)" ; return 1 ; }
+	: "${MDLT_ORIGIN:=$MMDAPP/.local}"
+	lepTool="$MDLT_ORIGIN/myx/myx.distro-.local/sh-scripts/DistroLocalTools.fn.sh"
+	[ -x "$lepTool" ] || { LancedbRefuse "the local tools are not here: $lepTool (the Python is theirs to install)" ; return 1 ; }
+	LANCEDB_BASE_PYTHON="$( MMDAPP="$MMDAPP" MDLT_ORIGIN="$MDLT_ORIGIN" "$lepTool" --install-embedded-python )" \
+		|| { LancedbRefuse "the embedded Python is not available (its reason is above), so nothing was installed" ; return 1 ; }
+	[ -x "$LANCEDB_BASE_PYTHON" ] || { LancedbRefuse "the embedded Python is not here: '$LANCEDB_BASE_PYTHON'" ; return 1 ; }
+}
+
+## what a failed run leaves: nothing of its own
+LancedbInstallUndo(){
+	rm -rf "$LANCEDB_HOME/venv" "$LANCEDB_HOME/model" "$LANCEDB_HOME/lancedb.env"
+	[ -z "$homeNew" ] || rm -rf "$LANCEDB_HOME"
+}
+
+LancedbInstall(){
+	fromFolder="" ; homeNew="" ; platform=""
+	while [ $# -gt 0 ] ; do
+		case "$1" in
+			--from-folder)
+				[ $# -ge 2 ] || { LancedbRefuse "$1 needs a folder" ; return 1 ; }
+				fromFolder="$2" ; shift 2
+			;;
+			--help)
+				sed -n '3,/^lancedbDir=/p' "$0" | sed -e '$d' -e 's/^## \{0,1\}//' >&2
+				return 0
+			;;
+			*)
+				LancedbRefuse "invalid option: $1"
+				return 1
+			;;
+		esac
+	done
+
+	LancedbHome || return 1
+
+	platform="$( LancedbPlatform )" || { LancedbRefuse "not installed here: $platform. Nothing was installed and nothing was written." ; return 3 ; }
+
+	## what pip places: lancedb and model2vec with all they need; on FreeBSD model2vec and safetensors alone, beside pkg's packages
+	pipNames="lancedb model2vec" pipWanted="lancedb==$LANCEDB_PIN_LANCEDB model2vec==$LANCEDB_PIN_MODEL2VEC" pipNoDeps="" venvSite=""
+	case "$platform" in
+		FreeBSD*) pipNames="model2vec safetensors" pipWanted="model2vec==$LANCEDB_PIN_MODEL2VEC safetensors==$LANCEDB_PIN_SAFETENSORS" pipNoDeps="--no-deps" venvSite="--system-site-packages --without-pip" ;;
+	esac
+
+	## what stands already
+	if [ -f "$LANCEDB_HOME/lancedb.env" ] && [ -x "$LANCEDB_HOME/venv/bin/python" ] \
+		&& [ "$( LancedbProbe 2> /dev/null )" = "lancedb=$LANCEDB_PIN_LANCEDB model2vec=$LANCEDB_PIN_MODEL2VEC dim=$LANCEDB_MODEL_DIM" ] ; then
+		LancedbSay "lancedb $LANCEDB_PIN_LANCEDB, model2vec $LANCEDB_PIN_MODEL2VEC and $LANCEDB_MODEL_NAME already installed: $LANCEDB_HOME"
+		printf '%s\n' "$LANCEDB_HOME/venv/bin/python"
+		return 0
+	fi
+
+	wheels="$LANCEDB_HOME/wheelhouse"
+	if [ -n "$fromFolder" ] ; then
+		[ -d "$fromFolder" ] || { LancedbRefuse "not a folder: $fromFolder" ; return 1 ; }
+		fromFolder="$( cd "$fromFolder" && pwd -P )"
+		for fromName in $pipNames ; do
+			ls "$fromFolder/$fromName"-*.whl > /dev/null 2>&1 || { LancedbRefuse "the folder has no $fromName wheel: $fromFolder" ; return 1 ; }
+		done
+		[ -f "$fromFolder/$LANCEDB_MODEL_NAME/model.safetensors" ] || { LancedbRefuse "the folder has no model: $fromFolder/$LANCEDB_MODEL_NAME/model.safetensors" ; return 1 ; }
+		wheels="$fromFolder"
+	fi
+
+	LancedbEmbeddedPython || return 1
+
+	[ -e "$LANCEDB_HOME" ] || homeNew="true"
+	if [ -e "$LANCEDB_HOME" ] && [ ! -f "$LANCEDB_HOME/$LANCEDB_HOME_MARK" ] && [ -n "$( ls -A "$LANCEDB_HOME" 2> /dev/null )" ] ; then
+		LancedbRefuse "$LANCEDB_HOME exists, is not empty and is not a folder of this feature (no $LANCEDB_HOME_MARK): nothing was touched"
+		return 1
+	fi
+	mkdir -p "$LANCEDB_HOME/tmp" || { LancedbRefuse "cannot make $LANCEDB_HOME" ; return 1 ; }
+	: > "$LANCEDB_HOME/$LANCEDB_HOME_MARK"
+
+	## the files: downloaded as binary packages alone (one resolution of both packages, so what they share is one version), or the folder given
+	if [ -z "$fromFolder" ] ; then
+		rm -rf "$wheels" ; mkdir -p "$wheels" || { LancedbRefuse "cannot make $wheels" ; LancedbInstallUndo ; return 1 ; }
+		LancedbSay "downloading $pipWanted, and what pip places with them, into $wheels..."
+		pipErr="$LANCEDB_HOME/tmp/pip-download.err"
+		## FreeBSD: model2vec as its wheel, safetensors built from source with pkg rust, as its port pulls in pytorch
+		case "$platform" in
+			FreeBSD*) LancedbRun "$LANCEDB_BASE_PYTHON" -m pip download --no-deps --only-binary=:all: -d "$wheels" "model2vec==$LANCEDB_PIN_MODEL2VEC" \
+				&& LancedbRun "$LANCEDB_BASE_PYTHON" -m pip wheel --no-deps --no-binary safetensors -w "$wheels" "safetensors==$LANCEDB_PIN_SAFETENSORS" ;;
+			*) LancedbRun "$LANCEDB_BASE_PYTHON" -m pip download --only-binary=:all: -d "$wheels" "lancedb==$LANCEDB_PIN_LANCEDB" "model2vec==$LANCEDB_PIN_MODEL2VEC" ;;
+		esac > "$pipErr" 2>&1 ; pipRc=$?
+		if [ "$pipRc" != 0 ] ; then
+			cat "$pipErr" >&2
+			missing="$( LC_ALL=C sed -n 's/^.*No matching distribution found for //p' "$pipErr" | head -1 )"
+			LancedbInstallUndo
+			if [ -n "$missing" ] ; then
+				LancedbRefuse "no binary package of $missing exists for this system ($platform): nothing was installed"
+			else
+				LancedbRefuse "pip could not download the packages (see above): nothing was installed"
+			fi
+			return 1
+		fi
+		rm -f "$pipErr"
+	fi
+
+	## BEFORE anything is placed: every package that would be, with its licence
+	list="$LANCEDB_HOME/tmp/packages.list"
+	LancedbRun "$LANCEDB_BASE_PYTHON" -c "$LANCEDB_PY_WHEELS" - "$wheels"/*.whl > "$list" || { LancedbRefuse "cannot read the packages in $wheels" ; LancedbInstallUndo ; return 1 ; }
+	LancedbSay "$( wc -l < "$list" | tr -d ' ' ) packages will be placed in $LANCEDB_HOME/venv, from the files in $wheels, with these licences:"
+	while IFS="$( printf '\t' )" read -r pkgName pkgVersion pkgLicence ; do
+		printf '    %-28s %-14s %s\n' "$pkgName" "$pkgVersion" "$pkgLicence" >&2
+	done < "$list"
+	LancedbSay "and the model $LANCEDB_MODEL_REPO at revision $LANCEDB_MODEL_REVISION (MIT)"
+
+	## the environment, and the packages installed into it from those files alone
+	rm -rf "$LANCEDB_HOME/venv"
+	LancedbRun "$LANCEDB_BASE_PYTHON" -m venv $venvSite "$LANCEDB_HOME/venv" || { LancedbRefuse "the Python could not make the environment: nothing was installed" ; LancedbInstallUndo ; return 1 ; }
+	LancedbRun "$LANCEDB_HOME/venv/bin/python" -m pip install --no-index $pipNoDeps --find-links "$wheels" $pipWanted >&2 \
+		|| { LancedbRefuse "pip could not install the packages from $wheels (see above): nothing was installed" ; LancedbInstallUndo ; return 1 ; }
+
+	## the model: its pinned revision, only the files model2vec reads, into the folder of the feature (the cache of the process is in it too)
+	rm -rf "$LANCEDB_HOME/model" ; mkdir -p "$LANCEDB_HOME/model" || { LancedbRefuse "cannot make $LANCEDB_HOME/model" ; LancedbInstallUndo ; return 1 ; }
+	if [ -n "$fromFolder" ] ; then
+		cp -R "$fromFolder/$LANCEDB_MODEL_NAME" "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME" || { LancedbRefuse "cannot copy the model from $fromFolder" ; LancedbInstallUndo ; return 1 ; }
+	else
+		LancedbSay "downloading $LANCEDB_MODEL_REPO ($LANCEDB_MODEL_REVISION), about 30 MB..."
+		LANCEDB_HF_OFFLINE=0
+		LancedbRun "$LANCEDB_HOME/venv/bin/python" -c '
+import sys
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3],
+    allow_patterns=["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.txt", "modules.json", "README.md"])
+' "$LANCEDB_MODEL_REPO" "$LANCEDB_MODEL_REVISION" "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME" >&2 ; modelRc=$?
+		LANCEDB_HF_OFFLINE=1
+		[ "$modelRc" = 0 ] || { LancedbRefuse "the model could not be downloaded (see above): nothing was installed" ; LancedbInstallUndo ; return 1 ; }
+	fi
+
+	## it must work: both import, the model loads from its folder with the net off, and encodes
+	probe="$( LancedbProbe )" || probe=""
+	if [ "$probe" != "lancedb=$LANCEDB_PIN_LANCEDB model2vec=$LANCEDB_PIN_MODEL2VEC dim=$LANCEDB_MODEL_DIM" ] ; then
+		LancedbRefuse "installed, and does not work on this system ($platform; the probe said '$probe'): the environment was not kept"
+		LancedbInstallUndo
+		return 1
+	fi
+
+	## what the licences ask: their files copied beside, and the list kept
+	mkdir -p "$LANCEDB_HOME/licenses"
+	LancedbRun "$LANCEDB_BASE_PYTHON" -c "$LANCEDB_PY_WHEELS" "$LANCEDB_HOME/licenses" "$wheels"/*.whl > "$LANCEDB_HOME/packages.txt.new" \
+		&& printf '%s\t%s\t%s\n' "$LANCEDB_MODEL_NAME" "$LANCEDB_MODEL_REVISION" "MIT (model, $LANCEDB_MODEL_REPO)" >> "$LANCEDB_HOME/packages.txt.new" \
+		&& mv -f "$LANCEDB_HOME/packages.txt.new" "$LANCEDB_HOME/packages.txt"
+	mkdir -p "$LANCEDB_HOME/licenses/$LANCEDB_MODEL_NAME-$LANCEDB_MODEL_REVISION"
+	cp "$LANCEDB_HOME/model/$LANCEDB_MODEL_NAME/README.md" "$LANCEDB_HOME/licenses/$LANCEDB_MODEL_NAME-$LANCEDB_MODEL_REVISION/" 2> /dev/null || :
+	rm -f "$list"
+
+	## written last: the environment is whole
+	{
+		printf 'LANCEDB_VERSION=%s\n' "$LANCEDB_PIN_LANCEDB"
+		printf 'MODEL2VEC_VERSION=%s\n' "$LANCEDB_PIN_MODEL2VEC"
+		printf 'LANCEDB_MODEL_NAME=%s\n' "$LANCEDB_MODEL_NAME"
+		printf 'LANCEDB_MODEL_REVISION=%s\n' "$LANCEDB_MODEL_REVISION"
+		printf 'LANCEDB_MODEL_DIM=%s\n' "$LANCEDB_MODEL_DIM"
+		printf "LANCEDB_PLATFORM='%s'\n" "$platform"
+	} > "$LANCEDB_HOME/lancedb.env"
+
+	LancedbSay "installed in $LANCEDB_HOME; licences in $LANCEDB_HOME/licenses, the list in $LANCEDB_HOME/packages.txt"
+	printf '%s\n' "$LANCEDB_HOME/venv/bin/python"
+}
+
+LancedbInstall "$@"
+exit $?
