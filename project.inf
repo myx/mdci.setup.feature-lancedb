@@ -1,4 +1,7 @@
 Name: setup.feature-lancedb
+Declares: \
+	mdci-installable:feature:setup.feature-lancedb \
+
 Requires: \
 	
 
